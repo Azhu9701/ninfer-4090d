@@ -1,0 +1,75 @@
+# 4090D 调优复盘（时间线）
+
+> 本文档是 [README](README.md) 的幕后记录：每一步尝试、数据、和当时不理解的东⻄后来怎么被解释的。
+
+## 起点
+
+继承到的部署（`run_4090d_serve.bat`，前人写好但从未稳定跑起来）：
+
+```
+ninfer-serve.exe qwen3_8_27b.ninfer
+  --max-context 131072 --kv-dtype rk2v4-e8 --kv-capacity auto
+  --max-concurrency 2 --spec mtp --draft-tokens 4 --lm-head-draft
+  --wddm-evictable-budget        ← 后来的主犯
+```
+
+## 时间线
+
+### Phase 0 — 连接与验证
+- UU远程 CLI 只能开终端窗口，无法注入输入 → 转向 Tailscale SSH（100.77.174.21）
+- `nvidia-smi`: RTX 4090 D, 49140 MiB, driver 616.56 ✓
+- 冒烟测试（`ninfer.exe --prompt`）: 15.92 GiB 权重 5.2s 加载, decode 49 tok/s → 引擎与模型本身健康
+
+### Phase 1 — 复现"静默死亡"
+- 后台 Start-Process 起 serve：stderr 停在 `loading model...`，进程消失，stdout 空，事件日志干净
+- 三次复现，两个不同死点：启动时死；一次跑到 8K prefill 中间（日志止于 prefill 1,113 tokens）死
+
+### Phase 2 — 二分定位
+写了个三组二分脚本（45s 存活窗口 + 真实 64K 请求验证）：
+
+| 组 | flags | 结果 |
+|---|---|---|
+| A | 无 MTP 无 wddm | ✅ 存活，64K 通过 |
+| B | +MTP | ✅ 存活，64K 通过（且 decode 93 vs 42 tok/s） |
+| C | +MTP+wddm | ✅ 45s 内活着 —— 但后来补测真实请求时死 |
+
+结论修订：**MTP 无罪，`--wddm-evictable-budget` 在"驱动桌面的卡"上不稳定**。读 `registry.cpp` 找到根因：该 flag 按*总显存*做预算，把桌面应用显存往 512MiB 底线驱逐，在这张正在跑 DWM 的卡上就是过度订阅。
+
+### Phase 3 — "SSH 会话杀进程"真相
+- 带 `-Wait` 的前台跑 180s 不退 → 服务其实活着
+- 从 Mac 直连 Tailscale IP 测试全 502 → **Clash 代理截胡**（`NO_PROXY` 解围）
+- 复盘"三次静默死亡"：全都是 sshd 非交互会话拉起的进程随会话被清。前台交互会话里的同命令活得好好的
+- **修法**：`schtasks /Create /TN NInferServe /SC ONLOGON /RL HIGHEST` —— 独立会话 + 开机自启 + 崩溃重启
+
+### Phase 4 — 速度调优
+- A/B `temperature 1.0 vs 0`：代码类 greedy 下 MTP 接受率显著更高
+- `--draft-tokens 4→7`：代码续写 149 → **197 tok/s**
+- 试 8、9：`cudaErrorGraphExecUpdateFailure` → serve 模式 MTP 天花板就是 7（与上游 bench 数据只在 serve 列 MTP7 吻合）
+- 中文/创意文本 MTP 收益小（接受率 ~40%）：符合物理，draft 难预测随机内容
+
+### Phase 5 — 磁盘缓存
+- `--disk-cache` 放 C 盘（ORICO NVMe；D 盘 Samsung 860 是 SATA，DirectStorage 不适用）
+- 64K payload：38.8s → **1.9s**（第二次），**1.8s**（服务重启后）→ NVMe→VRAM DMA 恢复 ~10GB/s，与上游 150ms/1.5GiB 数据同量级
+
+### Phase 6 — 吃满显存
+- 发现 22.9GB 显存闲置 → 读 `layouts_impl.h` 找到 `maximum_pages = max_concurrency × page_count(max_context)`
+- concurrency 2→4：KV 池 262K → **524,288 tokens**（11.68 GiB），KV 池自动翻倍
+- 4 路并发实测：每路 ~40 tok/s，总 ~159 —— 27B dense 的 decode 是带宽瓶颈，并发不加总量，但多 slot 对多 agent 场景有价值
+
+### Phase 7 — 服务化
+- `--api-key` 上鉴权（bind 0.0.0.0 暴露给 Tailscale 网段）
+- 三协议端到端验证：OpenAI chat/completions ✓、SSE 流式 ✓、Anthropic messages ✓
+
+## 最终配置 vs 初始配置
+
+| 项 | 初始 | 最终 | 变化原因 |
+|---|---|---|---|
+| wddm-evictable-budget | 开 | **删** | 坑#1 静默崩溃 |
+| draft-tokens | 4 | **7** | +32% 代码解码 |
+| kv-dtype | rk2v4-e8 | **rk4v4-e8** | 98.7% 保真，48G 撑得起 |
+| max-concurrency | 2 | **4** | KV 上限翻倍 524K |
+| max-pending | 32 | **64** | agent 突发 |
+| disk-cache | 无 | **200GB @NVMe** | TTFT 20x |
+| 部署方式 | 手工/SSH | **schtasks** | 坑#2 |
+| api-key | 无 | **有** | 暴露面治理 |
+| 代码速度 | — | **195 tok/s** | — |
