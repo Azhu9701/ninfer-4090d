@@ -31,13 +31,14 @@
 
 | 测试项 | 配置 | 吞吐 | 备注 |
 |---|---|---:|---|
-| **代码续写（greedy）** | MTP7 + `temperature=0` | **195–198 tok/s** | MTP 接受率最高的场景 |
+| **代码续写（greedy）** | MTP7 + `temperature=0` | **195–203 tok/s** | MTP 接受率最高的场景 |
 | 短 prompt 解码 | MTP7，英文 essay | 77–101 tok/s | 冷内容随机生成，MTP 难预测 |
 | 中文对话 | MTP7 | 70–80 tok/s | 同上 |
 | **64K prefill** | 64,491 tokens | **1,667–1,671 tok/s** | 38.8s 全量重算 |
 | **64K 磁盘缓存命中** | 同 payload 第 2 次 | **1.9s TTFT** | NVMe→VRAM DMA，**20x 提速** |
 | 64K 命中（跨进程重启） | 重启服务后同 payload | **1.8s** | 缓存持久化，10+ GB/s 恢复 |
-| 4 路并发 decode | `--max-concurrency 4` | 每路 ~40，总计 ~159 tok/s | 27B dense 受显存带宽约束 |
+| 4 路并发（静态 draft=7） | `--max-concurrency 4` | ~178 tok/s 总计 | 长 draft 的验证浪费 |
+| **4 路并发（动态 draft=2）** | `draft_controller.ps1` | **~264 tok/s 总计** | **+48%，见踩坑 #6** |
 | 权重加载 | 冷启动 | 16.67 GiB / 4.9s | pinned 双缓冲 DMA |
 | 模型总加载 | 到 listening | **6.5–7.8s** | 含 KV 池分配与 warmup |
 | MTP 接受率 | draft=7，通用对话 | ~40%（6.7 tok/round） | 代码类显著更高 |
@@ -121,6 +122,22 @@ CLI 帮助写 `--draft-tokens 1..15`，但 serve 模式下 8 和 9 都触发 `cu
 ### 坑 #5：客户端代理截胡 Tailscale 流量
 
 Mac 客户端挂着 Clash 时，`http://100.77.174.21:8080` 会被代理劫持返回 502——**表现为"服务挂了"，实际服务活得好好的**。所有客户端进程需要 `export NO_PROXY=100.77.174.21`，curl 加 `--noproxy '*'`。排障时先 `nc -z 100.77.174.21 8080` 确认端口再怀疑服务。
+
+### 坑 #6：MTP draft 深度的最优值随并发剧烈变化（D-cut 效应实证）
+
+上游/D-cut (arXiv 2026) 的结论在 4090 D 上完全复现，而且比论文更陡峭。同一 4 路并发负载（长 prompt、temperature=0、3 轮取均值）扫 draft 深度：
+
+| draft-tokens | 4 路并发总吞吐 | 单路（对照） |
+|---:|---:|---:|
+| **2** | **264 tok/s** ← 并发最优 | ~85 |
+| 3 | 254 tok/s | — |
+| 1 | 233 tok/s | — |
+| 4 | 186 tok/s | ~95 |
+| 7 | 178 tok/s | **195–203** ← 单路最优 |
+
+机理解读：并发 decode 时 GPU 已被多路分摊，MTP 验证是"一次 forward 验证 W 个 draft token"——draft 越长，**被拒绝 token 的验证算力浪费越大**，且 draft head 的 KV 读取也随长度线性涨（Windowed-MTP, arXiv 2026 指出该读取随全上下文增长）。低并发时 GPU 空闲算力充裕，长 draft 的收益（更多并行接受）占上风。
+
+**解法**：`draft_controller.ps1`（本仓库）——计划任务常驻的控制器，10s 采样 `/metrics` 的 `requests_processing`，连续 3 次 ≥2 并发切 `draft=2`、连续 6 次 ≤1 并发切回 `draft=7`（低档回切防抖更长，避免打断进行中的请求）。切换 = 改 bat + 计划任务重启 serve（加载 6.5s）。已在生产运行，双档自动切换实测无感。
 
 ## 5. 部署检查清单
 
