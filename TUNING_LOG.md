@@ -97,3 +97,10 @@ ninfer-serve.exe qwen3_8_27b.ninfer
 - `ninfer_console.ps1`：2s 增量追踪 task_err(SRV/红) + task_out(OUT/灰) + controller.log(CTL/青)，每 ~16s 打状态头（serve 状态 / draft 档位 / GPU 显存）；文件被轮转自动重开；初始回看各文件最后 8KB
 - 桌面双击入口：`NInfer Console.lnk` → `ninfer_console.bat`（start 独立窗口）。家用机不挂常驻，按需唤出
 - 编码坑：PowerShell 5.1 跑含中文的 ps1 必须 **UTF-8 BOM + CRLF**，否则 GBK 乱码
+
+### Phase 11 — 第二种漂移形态：有外壳无闭合 (2026-09-04 02:00)
+- **新形态**：`<tool_call> <function=Bash> <parameter=command> ... <parameter=description> ... </tool_call>`——有外壳但 `</parameter>`/`</function>` 全缺（zcode req48 实测 `finish=stop_token`，漂移漏成文本 → 回合终止）
+- **扩展挽救**：严格解析失败时二次挽救——定位 `<function=name>`，参数按"下一个 `<parameter=` 标记或闭合标签先到者"切边界取值，不需要闭合标签。**截断块（无 `</tool_call>`）明确拒绝**（半截命令不能执行）
+- 挽救安全门与裸块路径共用：导语 <400 字符、无代码围栏/缩进代码
+- 单测 18/18（新增：真实畸形样例挽救/无参数拒绝/长导语拒绝/截断拒绝），E2E 漂移诱导 → tool_calls {"city":"Paris","days":2} ✓
+- **插曲：controller.log 文件锁**——桌面控制台窗口（PowerShell -NoExit）以默认 FileShare 读日志时阻塞了 Add-Content，控制器心跳停摆 26 分钟但进程活着。教训：任务状态码/进程活着 ≠ 业务活着，**心跳才是真相**（SKILL 已有此条，再次验证）

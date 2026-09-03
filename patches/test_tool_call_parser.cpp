@@ -248,6 +248,57 @@ int test_incremental_filter_holds_bare_block() {
     return failures;
 }
 
+int test_malformed_wrapped_block_salvaged() {
+    // 用户报告的 zcode 挂起形态：有外壳，但 </parameter>/</function> 全缺
+    const std::string text =
+        "<tool_call> <function=Bash> <parameter=command> printf '%s' '{\"a\":1}' > /tmp/t3.json && ssh h 'curl x' "
+        "<parameter=description> Probe customer-service DB question _ </tool_call>";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 128);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "malformed wrapped block salvaged");
+    failures += check(parsed.tool_calls.size() == 1, "one salvaged call");
+    failures += check(parsed.tool_calls[0].name == "Bash", "salvaged name Bash");
+    const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+    failures += check(args.contains("command") && args.contains("description"),
+                      "both parameters salvaged despite missing closers");
+    failures += check(std::string(args.at("command")).find("printf") != std::string::npos,
+                      "command value intact");
+    return failures;
+}
+
+int test_malformed_wrapped_no_params_falls_back() {
+    const std::string text = "<tool_call> <function=Read> </tool_call>";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+    int failures = 0;
+    failures += check(!parsed.is_tool_call_response, "no params at all refuses salvage");
+    failures += check(parsed.content == text, "no-params fallback preserves text");
+    return failures;
+}
+
+int test_malformed_wrapped_lead_too_long_falls_back() {
+    const std::string lead(500, 'x');
+    const std::string text =
+        lead + "\n<tool_call> <function=Read> <parameter=p> v </tool_call>";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+    int failures = 0;
+    failures += check(!parsed.is_tool_call_response, "long lead refuses wrapped salvage");
+    failures += check(parsed.content == text, "long lead fallback preserves text");
+    return failures;
+}
+
+int test_malformed_wrapped_truncated_falls_back() {
+    const std::string text = "<tool_call> <function=Read> <parameter=p> partial";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+    int failures = 0;
+    failures += check(!parsed.is_tool_call_response, "truncated wrapped block refuses salvage");
+    failures += check(parsed.content == text, "truncated fallback preserves text");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -266,6 +317,10 @@ int main() {
     failures += test_bare_block_malformed_params_fall_back();
     failures += test_bare_block_trailing_prose_falls_back();
     failures += test_incremental_filter_holds_bare_block();
+    failures += test_malformed_wrapped_block_salvaged();
+    failures += test_malformed_wrapped_no_params_falls_back();
+    failures += test_malformed_wrapped_lead_too_long_falls_back();
+    failures += test_malformed_wrapped_truncated_falls_back();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -1,5 +1,5 @@
 --- ninfer-ref/src/serve/tool_call_parser.cpp	2026-09-03 04:02:34
-+++ patch/tool_call_parser.cpp	2026-09-04 01:29:57
++++ patch/tool_call_parser.cpp	2026-09-04 02:05:46
 @@ -15,6 +15,11 @@
  
  using Json = nlohmann::json;
@@ -23,7 +23,7 @@
      skip_ws(block, pos);
      if (!starts_with_at(block, pos, kFunctionOpen)) { return false; }
      const std::size_t name_begin = pos + kFunctionOpen.size();
-@@ -116,6 +119,74 @@
+@@ -116,6 +119,138 @@
      return true;
  }
  
@@ -95,10 +95,74 @@
 +    return true;
 +}
 +
++// Lax parameter extraction for malformed (unclosed) blocks. Finds
++// "<parameter=name>" markers, takes the value up to the next marker or
++// closing tag, trims, JSON-parses or keeps string. Does NOT require
++// </parameter> closers. Returns false if nothing valid found.
++bool salvage_parameters(std::string_view inner, Json& args) {
++    constexpr std::string_view kParamOpen = "<parameter=";
++    std::size_t pos = 0;
++    bool found_any = false;
++    while (pos < inner.size()) {
++        const std::size_t open = inner.find(kParamOpen, pos);
++        if (open == std::string_view::npos) { break; }
++        const std::size_t name_begin = open + kParamOpen.size();
++        const std::size_t name_end   = inner.find('>', name_begin);
++        if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
++        const std::string key = std::string(inner.substr(name_begin, name_end - name_begin));
++
++        // Value runs to the next parameter marker, or any closing tag, or
++        // end of block — whichever comes first.
++        std::size_t value_end = inner.size();
++        const std::size_t next_param = inner.find(kParamOpen, name_end + 1);
++        if (next_param != std::string_view::npos && next_param < value_end) { value_end = next_param; }
++        const std::size_t f_close = inner.find("</function>", name_end + 1);
++        if (f_close != std::string_view::npos && f_close < value_end) { value_end = f_close; }
++        const std::size_t t_close = inner.find("</tool_call>", name_end + 1);
++        if (t_close != std::string_view::npos && t_close < value_end) { value_end = t_close; }
++        const std::size_t p_close = inner.find("</parameter>", name_end + 1);
++        if (p_close != std::string_view::npos && p_close < value_end) { value_end = p_close; }
++
++        const std::string raw_value = trim_ascii(inner.substr(name_end + 1, value_end - name_end - 1));
++        Json parsed = Json::parse(raw_value, nullptr, false);
++        args[key]   = parsed.is_discarded() ? Json(raw_value) : parsed;
++        found_any = true;
++        pos = value_end;
++    }
++    return found_any;
++}
++
++// Lax single-block rescue: the model produced a <tool_call> wrapper but the
++// interior is malformed (missing </function> / </parameter> closers).
++// Strategy: locate "<function=name>", extract name, then salvage all
++// "<parameter=name>..." values. Zero tolerance for structural junk —
++// if we can't find a valid function name or any parameter, no rescue.
++bool try_salvage_malformed_block(std::string_view block, std::size_t max_tool_name_length,
++                                 ToolCall& out) {
++    constexpr std::string_view kFunctionOpen = "<function=";
++    const std::size_t fn_pos = block.find(kFunctionOpen);
++    if (fn_pos == std::string_view::npos) { return false; }
++    const std::size_t name_begin = fn_pos + kFunctionOpen.size();
++    const std::string_view rest  = block.substr(name_begin);
++    const std::size_t name_end   = rest.find('>');
++    if (name_end == std::string_view::npos || name_end == 0) { return false; }
++    const std::string name = std::string(rest.substr(0, name_end));
++    if (!valid_function_name(name, max_tool_name_length)) { return false; }
++
++    Json args = Json::object();
++    const std::string_view params = rest.substr(name_end + 1);
++    if (!salvage_parameters(params, args)) { return false; }
++
++    out.id             = new_tool_call_id();
++    out.name           = name;
++    out.arguments_json = args.dump();
++    return true;
++}
++
  ParsedToolCallOutput fallback(const std::string& text) {
      ParsedToolCallOutput out;
      out.content = text;
-@@ -126,11 +197,14 @@
+@@ -126,15 +261,23 @@
  
  ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                   std::size_t max_tool_name_length) {
@@ -117,7 +181,36 @@
  
      ParsedToolCallOutput out;
      out.content = rtrim_ascii(std::string_view(text).substr(0, first));
-@@ -165,9 +239,16 @@
+ 
++    // Lead-in rules: long essays or fenced code preceding the wrapper means
++    // this is an example being discussed, not an attempted call — refuse
++    // rescue and pass through verbatim.
++    const bool lead_ok = lead_in_may_precede_salvaged_call(std::string_view(text).substr(0, first));
++
+     std::size_t pos = first;
+     while (pos < text.size()) {
+         skip_ws(text, pos);
+@@ -142,11 +285,15 @@
+         if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text); }
+         const std::size_t inner_begin = pos + kToolOpen.size();
+         const std::size_t close       = text.find(kToolClose, inner_begin);
+-        if (close == std::string::npos) { return fallback(text); }
++        if (close == std::string::npos) { return fallback(text); }  // truncated: refuse
++        const std::string_view inner = std::string_view(text).substr(inner_begin, close - inner_begin);
+         ToolCall call;
+-        if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
+-                                 max_tool_name_length, call)) {
+-            return fallback(text);
++        if (!parse_one_tool_call(inner, max_tool_name_length, call)) {
++            // Strict parse failed. Attempt bounded salvage: valid function
++            // name + extractable parameters, short clean lead-in only.
++            if (!lead_ok || !try_salvage_malformed_block(inner, max_tool_name_length, call)) {
++                return fallback(text);
++            }
+         }
+         out.tool_calls.push_back(std::move(call));
+         pos = close + kToolClose.size();
+@@ -165,9 +312,16 @@
          return {};
      }
  
@@ -136,7 +229,7 @@
      if (marker != std::string::npos) {
          std::size_t safe_end = marker;
          while (safe_end != 0 &&
-@@ -182,7 +263,8 @@
+@@ -182,7 +336,8 @@
          return visible;
      }
  
