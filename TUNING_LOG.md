@@ -73,3 +73,11 @@ ninfer-serve.exe qwen3_8_27b.ninfer
 | 部署方式 | 手工/SSH | **schtasks** | 坑#2 |
 | api-key | 无 | **有** | 暴露面治理 |
 | 代码速度 | — | **195 tok/s** | — |
+
+### Phase 8 — 视觉与控制器任务修复 (2026-09-03)
+- `--vision` 是启动期开关：**运行时不可补开**（上游文档明言 "A later request cannot enable a capability omitted at startup"）。默认关闭省显存；中转站报 `Vision is disabled for this server` 时先查服务启动参数，不是模型不支持
+- 与 `--spec dflash` 互斥，与 `--spec mtp` 可共存（本配置 vision+MTP7 实测正常）
+- 显存代价：权重后 free 29.5 GiB → 19.4 GiB（视觉塔 + scratch ~10GiB），KV 池 auto 不受影响
+- 视觉请求验证：base64 data-URL 红色测试图 → 正确回答「红色」，文本回归 200
+- **坑#3：计划任务 `cmd → start /B powershell` 两层包装会被作业对象收割**——cmd 立即退出时任务结束，Task Scheduler 把刚拉起的 powershell 一起杀（时序竞态，之前能活是运气）。修法：任务动作直接指 `powershell -File`，或运行时用 `Start-Process` 拉起脱离父进程
+- 排障教训：sshd 管道里的 stderr 会串扰（上次失败命令的「拒绝访问」混进本次结果）；判断进程死活的唯一可信标准是**业务日志有无新心跳**，任务状态码/进程快照都可能骗人
