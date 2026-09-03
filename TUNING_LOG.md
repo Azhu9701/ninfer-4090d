@@ -91,3 +91,9 @@ ninfer-serve.exe qwen3_8_27b.ninfer
 - **测试**：解析器 14/14（原 7 + 新 7：挽救/导语/围栏/畸形/尾随散文/流式扣留/字节还原），MSVC 2022 cl 直接编 test+parser 目标验证
 - **端到端**（patched 二进制）：漂移诱导 → tool_calls/`tool_use` + `finish_reason=tool_calls`/`tool_use`、零泄漏；规范 `<tool_call>` 路径回归 ✓；纯文本回归 ✓；OpenAI 与 Anthropic 双协议 ✓
 - **部署**：ninja 重链 apps/ninfer-serve.exe（增量 2 步）+ 滚动重启，服务恢复完整形态
+
+### Phase 10 — 只读日志控制台 (2026-09-04)
+- 需求：后端日志终端可见，方便管理。原则：**日志文件是唯一真相，控制台只做只读观众**（FileStream FileShare.ReadWrite）——关窗/Ctrl+C 任何时候都安全，绝不影响 serve（与坑#3 作业对象收割正好相反方向的教训：观众进程死了无所谓）
+- `ninfer_console.ps1`：2s 增量追踪 task_err(SRV/红) + task_out(OUT/灰) + controller.log(CTL/青)，每 ~16s 打状态头（serve 状态 / draft 档位 / GPU 显存）；文件被轮转自动重开；初始回看各文件最后 8KB
+- 桌面双击入口：`NInfer Console.lnk` → `ninfer_console.bat`（start 独立窗口）。家用机不挂常驻，按需唤出
+- 编码坑：PowerShell 5.1 跑含中文的 ps1 必须 **UTF-8 BOM + CRLF**，否则 GBK 乱码
