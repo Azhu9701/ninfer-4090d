@@ -104,3 +104,11 @@ ninfer-serve.exe qwen3_8_27b.ninfer
 - 挽救安全门与裸块路径共用：导语 <400 字符、无代码围栏/缩进代码
 - 单测 18/18（新增：真实畸形样例挽救/无参数拒绝/长导语拒绝/截断拒绝），E2E 漂移诱导 → tool_calls {"city":"Paris","days":2} ✓
 - **插曲：controller.log 文件锁**——桌面控制台窗口（PowerShell -NoExit）以默认 FileShare 读日志时阻塞了 Add-Content，控制器心跳停摆 26 分钟但进程活着。教训：任务状态码/进程活着 ≠ 业务活着，**心跳才是真相**（SKILL 已有此条，再次验证）
+
+### Phase 12 — 便携打包 (2026-09-04)
+- `portable/`：单目录自包含——bin(exe+9DLL) / models / config(settings.cmd 唯一配置源) / logs / state / serve.bat / draft_controller.ps1 / install.ps1 / uninstall.ps1 / start|stop.bat / status.ps1 / console.bat / README.md
+- 全部路径相对包根（`%~dp0` / `$PSScriptRoot`），拷目录即迁移；模型 16.96GB 同盘 move 瞬时
+- serve.bat 内建日志轮转（100MB 阈值保 2 代）+ 启动时间戳记录
+- 控制器加单实例守卫（state/controller.pid）
+- 生产已切换至 C:\ninfer-rtx，staging(8081) 与生产全量冒烟通过（text/vision/401/漂移挽救正反手）
+- 反误伤守卫实测生效：模型把漂移文本包进 ``` 围栏时，挽救路径正确拒绝透传为文本
