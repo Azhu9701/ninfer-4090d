@@ -1,0 +1,148 @@
+--- ninfer-ref/src/serve/tool_call_parser.cpp	2026-09-03 04:02:34
++++ patch/tool_call_parser.cpp	2026-09-04 01:29:57
+@@ -15,6 +15,11 @@
+ 
+ using Json = nlohmann::json;
+ 
++constexpr std::string_view kToolOpen    = "<tool_call>";
++constexpr std::string_view kToolClose   = "</tool_call>";
++constexpr std::string_view kFunctionOpen  = "<function=";
++constexpr std::string_view kFunctionClose = "</function>";
++
+ std::string trim_ascii(std::string_view text) {
+     std::size_t begin = 0;
+     while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
+@@ -83,9 +88,7 @@
+ }
+ 
+ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length, ToolCall& out) {
+-    constexpr std::string_view kFunctionOpen  = "<function=";
+-    constexpr std::string_view kFunctionClose = "</function>";
+-    std::size_t pos                           = 0;
++    std::size_t pos = 0;
+     skip_ws(block, pos);
+     if (!starts_with_at(block, pos, kFunctionOpen)) { return false; }
+     const std::size_t name_begin = pos + kFunctionOpen.size();
+@@ -116,6 +119,74 @@
+     return true;
+ }
+ 
++// Salvage path for "bare function-call" drift: the model omits the canonical
++// <tool_call> wrapper and emits <function=...>...</function> blocks directly.
++// This is a known failure mode when the surrounding agent transcript contains
++// foreign tool-call formats the model imitates. The block shape is still
++// unambiguous, so a strict structural check lets us rescue the call instead of
++// returning prose that silently ends the agent turn.
++//
++// Strictness contract (any violation -> no salvage, verbatim text):
++//   * lead-in prose before the first block is short (<400 chars) and carries
++//     no code-fence / indented-code cues (an echo of this format in ordinary
++//     content almost always sits inside a fenced or indented code sample);
++//   * every block is a fully well-formed <function=...><parameter=...>
++//     </parameter>...</function> construct (parse_one_tool_call, reused);
++//   * between and after blocks only whitespace and stray "</tool_call>"
++//     wrappers are tolerated (the drift sometimes keeps the closer).
++bool lead_in_may_precede_salvaged_call(std::string_view lead) {
++    while (!lead.empty() && std::isspace(static_cast<unsigned char>(lead.back())) != 0) {
++        lead.remove_suffix(1);
++    }
++    if (lead.size() >= 400) { return false; }
++    if (lead.find("```") != std::string_view::npos) { return false; }
++    if (lead.find("\n\t") != std::string_view::npos) { return false; }
++    if (lead.find("\n    ") != std::string_view::npos) { return false; }
++    return true;
++}
++
++bool try_salvage_bare_function_calls(const std::string& text, std::size_t max_tool_name_length,
++                                     ParsedToolCallOutput& out) {
++    const std::size_t first = text.find(kFunctionOpen);
++    if (first == std::string::npos) { return false; }
++    if (!lead_in_may_precede_salvaged_call(std::string_view(text).substr(0, first))) { return false; }
++
++    ParsedToolCallOutput candidate;
++    std::size_t pos = first;
++    while (pos < text.size()) {
++        skip_ws(text, pos);
++        while (starts_with_at(text, pos, kToolClose)) {
++            pos += kToolClose.size();
++            skip_ws(text, pos);
++        }
++        if (pos >= text.size()) { break; }
++        if (!starts_with_at(text, pos, kFunctionOpen)) { return false; }
++        const std::size_t block_end = text.find(kFunctionClose, pos);
++        if (block_end == std::string_view::npos) { return false; }
++        ToolCall call;
++        if (!parse_one_tool_call(std::string_view(text).substr(pos, block_end + kFunctionClose.size() - pos),
++                                 max_tool_name_length, call)) {
++            return false;
++        }
++        candidate.tool_calls.push_back(std::move(call));
++        pos = block_end + kFunctionClose.size();
++    }
++
++    if (candidate.tool_calls.empty()) { return false; }
++    candidate.is_tool_call_response = true;
++    std::string content = rtrim_ascii(std::string_view(text).substr(0, first));
++    // Stray "</tool_call>" wrappers sometimes leak into the lead-in; they are
++    // drift debris, not content.
++    while (content.size() >= kToolClose.size() && content.compare(
++               content.size() - kToolClose.size(), kToolClose.size(), kToolClose) == 0) {
++        content.resize(content.size() - kToolClose.size());
++        content = rtrim_ascii(content);
++    }
++    candidate.content = std::move(content);
++    out               = std::move(candidate);
++    return true;
++}
++
+ ParsedToolCallOutput fallback(const std::string& text) {
+     ParsedToolCallOutput out;
+     out.content = text;
+@@ -126,11 +197,14 @@
+ 
+ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
+                                                  std::size_t max_tool_name_length) {
+-    constexpr std::string_view kToolOpen  = "<tool_call>";
+-    constexpr std::string_view kToolClose = "</tool_call>";
+-
+     const std::size_t first = text.find(kToolOpen);
+-    if (first == std::string::npos) { return fallback(text); }
++    if (first == std::string::npos) {
++        ParsedToolCallOutput salvaged;
++        if (try_salvage_bare_function_calls(text, max_tool_name_length, salvaged)) {
++            return salvaged;
++        }
++        return fallback(text);
++    }
+ 
+     ParsedToolCallOutput out;
+     out.content = rtrim_ascii(std::string_view(text).substr(0, first));
+@@ -165,9 +239,16 @@
+         return {};
+     }
+ 
+-    constexpr std::string_view kToolOpen = "<tool_call>";
+     pending_.append(text);
+-    const std::size_t marker = pending_.find(kToolOpen);
++    // Hold from the earliest of the two markers: the canonical <tool_call>
++    // wrapper or a drifted bare <function=...> block. Holding on a false
++    // positive is harmless: at terminal time the parser classifies the output
++    // and finish() flushes a non-tool region verbatim.
++    std::size_t marker    = pending_.find(kToolOpen);
++    const std::size_t fmarker = pending_.find(kFunctionOpen);
++    if (fmarker != std::string::npos && (marker == std::string::npos || fmarker < marker)) {
++        marker = fmarker;
++    }
+     if (marker != std::string::npos) {
+         std::size_t safe_end = marker;
+         while (safe_end != 0 &&
+@@ -182,7 +263,8 @@
+         return visible;
+     }
+ 
+-    const std::size_t prefix = longest_suffix_prefix(pending_, kToolOpen);
++    const std::size_t prefix = std::max(longest_suffix_prefix(pending_, kToolOpen),
++                                        longest_suffix_prefix(pending_, kFunctionOpen));
+     std::size_t safe_end     = pending_.size() - prefix;
+     while (safe_end != 0 && std::isspace(static_cast<unsigned char>(pending_[safe_end - 1])) != 0) {
+         --safe_end;

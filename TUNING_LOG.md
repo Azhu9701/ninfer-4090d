@@ -81,3 +81,13 @@ ninfer-serve.exe qwen3_8_27b.ninfer
 - 视觉请求验证：base64 data-URL 红色测试图 → 正确回答「红色」，文本回归 200
 - **坑#3：计划任务 `cmd → start /B powershell` 两层包装会被作业对象收割**——cmd 立即退出时任务结束，Task Scheduler 把刚拉起的 powershell 一起杀（时序竞态，之前能活是运气）。修法：任务动作直接指 `powershell -File`，或运行时用 `Start-Process` 拉起脱离父进程
 - 排障教训：sshd 管道里的 stderr 会串扰（上次失败命令的「拒绝访问」混进本次结果）；判断进程死活的唯一可信标准是**业务日志有无新心跳**，任务状态码/进程快照都可能骗人
+
+### Phase 9 — 工具调用格式漂移挽救补丁 (2026-09-04)
+- **现象**：agent（zcode/pi）长会话中模型偶发输出裸 `<function=名字><parameter=...>` 块（缺 `<tool_call>` 外壳，训练转录体里的异框架格式污染）。原解析器按「malformed → 透传为文本」处理 → agent 收到纯文本当最终回答 → **回合静默终止**
+- **根因链**：tools=53 已渲染进系统块（requests.jsonl 实锤）→ 模型输出漂移 → 解析器不认 → 客户端判停
+- **补丁**（`patches/0001-tool-call-drift-salvage.patch`，改 `src/serve/tool_call_parser.cpp`）：
+  - 无外壳时尝试挽救：块结构完整（parse_one_tool_call 复用）+ 导语 <400 字符且无代码围栏/缩进代码痕迹 + 块外仅空白与游离 `</tool_call>`（剥除）→ 解析为结构化 tool_calls；任一条件不满足维持原文透传，零误伤
+  - 流式过滤器同步扣住 `<function=`（false positive 无害：finish 按终态分类回冲）
+- **测试**：解析器 14/14（原 7 + 新 7：挽救/导语/围栏/畸形/尾随散文/流式扣留/字节还原），MSVC 2022 cl 直接编 test+parser 目标验证
+- **端到端**（patched 二进制）：漂移诱导 → tool_calls/`tool_use` + `finish_reason=tool_calls`/`tool_use`、零泄漏；规范 `<tool_call>` 路径回归 ✓；纯文本回归 ✓；OpenAI 与 Anthropic 双协议 ✓
+- **部署**：ninja 重链 apps/ninfer-serve.exe（增量 2 步）+ 滚动重启，服务恢复完整形态
