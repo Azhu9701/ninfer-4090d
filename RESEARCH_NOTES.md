@@ -38,13 +38,29 @@ schedule::MtpGqaEnvelopes mtp_gqa_envelopes(std::uint32_t max_frontier, std::uin
 
 `GqaExecutionEnvelope{min_visible_keys, max_visible_keys}` 就是 attention 的 KV 可见范围（`include/ninfer/ops/gqa_attention.h`），draft AR 步的可见上界直接取 `frontier + k + step`——**没有任何窗口截断**，与论文描述的"full-context draft-KV"完全一致。
 
-### 给上游的窗口化建议
+### 消融实验：draft AR 步 vs verify 阶段（决定性发现）
 
-- MTP draft 头只有 1 层（`mtp_layers=1`），它的 attention 质量对远处 key 的依赖远低于 target 层；窗口化（如最近 8K–16K + 任意 sink tokens）对接受率的影响需要实验，但读取量从 O(frontier) 降到 O(window)。
-- 实现切口很小：`mtp_gqa_envelopes()` 的 `out.ar[step]` 与 `mtp_impl.h` 的 `bridge_envelope` 改为 `visible(min(capacity, draft_window_cap))`；KV page gather 已按页表进行，不需要物理重排。
-- 注意 CUDA Graph 的 envelope 是捕获期固化的（`program_impl.h:1494` warmup 用 `code_warm.max`），窗口化后 visible 随 frontier 增长变为动态值，需要改为按页表 gather + 固定窗口宽度，或分段重捕获。这可能是上游把它留成 full-context 的真实原因。
+窗口化只能省掉 draft AR 步的全上下文读取（`k-1` 步）。为了拆分"税"的构成，做了 `--draft-tokens 1` 消融（draft 只有 1 步 AR，把 AR 读取降到最低）：
 
-**结论**：税是真的（37%），修复方向明确，但触及 CUDA Graph 捕获语义，属于上游级改动，已具备提 issue 的全部素材。
+| 模式 | 64K decode | 加速比 vs 基线 |
+|---|---:|---:|
+| 无 MTP | 36.5 tok/s | 1.00x |
+| MTP1 | 78.4 tok/s | 2.15x |
+| MTP7 | 84.6 tok/s | 2.32x |
+
+**MTP1 ≈ MTP7（差 8%）**——如果 draft AR 步的全上下文读取是税的大头，MTP1 应该远快于 MTP7。反过来说明：
+
+1. **税的大头在 target_verify 阶段本身**：verify 必须对 `k+1` 列 draft token 读全上下文 KV——这是投机解码的本质开销，窗口化省不掉。
+2. **窗口化的真实可省收益只有 ~7%**（MTP7 中 draft AR 步的读取份额），且要冒接受率下降的风险——ROI 太差，不值得动 CUDA Graph 捕获语义。
+3. 64K 下 MTP7 仍有 2.32x 净加速——"税"是相对衰减的观感，绝对收益仍然显著。
+
+### 给上游的窗口化建议（修正版）
+
+- **不建议**为 27B 单卡场景做 draft-KV 窗口化：可省份额仅 ~7%，且 verify 阶段的全上下文读取（不可省部分）主导上下文衰减。
+- 若上游仍想探索（面向 1M+ token 场景）：`mtp_gqa_envelopes()`（`program_impl.h:50`）的 `out.ar[step]` 改为 `visible(min(capacity, draft_window_cap))` 是切口；内核侧 `valid_columns[batch]` 已是运行时数组、`Offset`/`column_begin` 模板分支已存在（`gqa_attention_decode.cuh:148`），滑窗起点机制有现成挂点。难点在 CUDA Graph：envelope 捕获期固化，需按窗口档位重排 profile 分桶。
+- 真正的 64K decode 提升空间在 verify 阶段的 KV 读取效率（如 GQA INT8 split 波型对 114 SM 的再对齐）或更低成本的 verify 路径，而非 draft 窗口化。
+
+**结论修正**：税是真的（37%），但构成出乎意料——它主要是投机解码 verify 阶段的本质成本，不是 draft 头的实现缺陷。窗口化 ROI 差，不推荐自行改引擎。
 
 ## 2. KV 量化前沿：E8 晶格在 115K–329K 无"2-bit 悬崖"
 
